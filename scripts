@@ -1,0 +1,129 @@
+<#
+.SYNOPSIS
+    Basic Windows Endpoint Triage Collection for Incident Response
+.DESCRIPTION
+    Collects key artifacts into a timestamped folder. Highlights potentially suspicious processes.
+    Run as Administrator for best results.
+
+#>
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$outputPath = "C:\IR_Collection_$timestamp"
+
+if (-not (Test-Path $outputPath)) {
+    New-Item -ItemType Directory -Path $outputPath | Out-Null
+}
+
+Write-Host "Collecting data to: $outputPath" -ForegroundColor Green
+
+Get-ComputerInfo | Select-Object `
+    WindowsProductName, WindowsVersion, OsArchitecture, `
+    TotalPhysicalMemory, CsName, CsUserName, CsDomain, `
+    BiosBIOSVersion, BiosManufacturer, OsLastBootUpTime |
+    Out-File "$outputPath\SystemInfo.txt"
+
+Get-HotFix | Select-Object HotFixID, Description, InstalledBy, InstalledOn |
+    Sort-Object InstalledOn -Descending |
+    Out-File "$outputPath\Hotfixes.txt"
+
+Get-LocalUser | Select-Object Name, Enabled, Description, LastLogon, PasswordLastSet, SID |
+    Export-Csv "$outputPath\LocalUsers.csv" -NoTypeInformation
+
+Get-LocalGroup | Select-Object Name, Description, SID |
+    Export-Csv "$outputPath\LocalGroups.csv" -NoTypeInformation
+
+$processes = Get-CimInstance Win32_Process | Select-Object `
+    ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine,
+    @{Name="Owner"; Expression={ try { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User } catch { "N/A" } }},
+    CreationDate
+
+$processes | Export-Csv "$outputPath\Processes_Full.csv" -NoTypeInformation
+
+$suspicious = $processes | Where-Object {
+    ($_.ExecutablePath -eq $null) -or
+    ($_.ExecutablePath -like "*\Temp\*") -or
+    ($_.ExecutablePath -like "*\AppData\*") -or
+    ($_.ExecutablePath -like "*\Downloads\*") -or
+    ($_.ExecutablePath -like "*\Public\*") -or
+    ($_.ExecutablePath -like "*\PerfLogs\*")
+}
+
+if ($suspicious) {
+    $suspicious | Format-Table ProcessId, Name, ExecutablePath, Owner, CommandLine -Wrap |
+        Out-File "$outputPath\Suspicious_Processes.txt"
+    Write-Host "Suspicious processes detected! See Suspicious_Processes.txt" -ForegroundColor Yellow
+}
+
+Get-NetTCPConnection | Where-Object State -eq "Established" |
+    Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess, CreationTime |
+    Export-Csv "$outputPath\TCP_Connections.csv" -NoTypeInformation
+
+Get-NetUDPEndpoint |
+    Select-Object LocalAddress, LocalPort, OwningProcess |
+    Export-Csv "$outputPath\UDP_Endpoints.csv" -NoTypeInformation
+
+Get-CimInstance Win32_Service |
+    Select-Object Name, DisplayName, State, StartMode, PathName |
+    Export-Csv "$outputPath\Services.csv" -NoTypeInformation
+
+Get-ScheduledTask | Where-Object State -ne "Disabled" |
+    Select-Object TaskName, TaskPath, State, Author, Actions, Triggers |
+    Export-Csv "$outputPath\ScheduledTasks.csv" -NoTypeInformation
+
+$runKeys = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+)
+
+foreach ($key in $runKeys) {
+    if (Test-Path $key) {
+        $safeName = ($key -replace '[:\\]', '_')
+        Get-ItemProperty $key | Out-File "$outputPath\RunKey_$safeName.txt"
+    }
+}
+
+$startupFolders = @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+    "$env:PROGRAMDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+)
+
+"Startup Folder Items:" | Out-File "$outputPath\StartupItems.txt"
+foreach ($folder in $startupFolders) {
+    if (Test-Path $folder) {
+        "$folder" | Out-File "$outputPath\StartupItems.txt" -Append
+        Get-ChildItem $folder | Select-Object Name, FullName, CreationTimeUtc, LastWriteTimeUtc |
+            Out-File "$outputPath\StartupItems.txt" -Append
+    }
+}
+
+ipconfig /displaydns | Out-File "$outputPath\DNSCache.txt"
+
+Write-Host "Collection complete! Review the folder: $outputPath" -ForegroundColor Green
+Write-Host "Tip: Zip the folder and analyze offline." -ForegroundColor Cyan
+
+Write-Host "Exporting Security event log (last 5000 events)..." -ForegroundColor Cyan
+try {
+    Get-WinEvent -LogName Security -MaxEvents 5000 -ErrorAction Stop |
+        Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+        Export-Csv "$outputPath\SecurityEvents.csv" -NoTypeInformation
+    Write-Host "Security events exported successfully." -ForegroundColor Green
+} catch {
+    "Failed to export Security events: $_" | Out-File "$outputPath\SecurityEvents_Error.txt"
+    Write-Host "Failed to export Security events (see SecurityEvents_Error.txt)" -ForegroundColor Red
+}
+$logs = @("Security", "System", "Application")
+foreach ($log in $logs) {
+    $file = "$outputPath\$log`Events.csv"
+    Write-Host "Exporting $log event log (last 5000)..." -ForegroundColor Cyan
+    try {
+        Get-WinEvent -LogName $log -MaxEvents 5000 -ErrorAction Stop |
+            Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+            Export-Csv $file -NoTypeInformation
+        Write-Host "$log events exported." -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to export $log events: $_" -ForegroundColor Red
+    }
+}
