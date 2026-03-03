@@ -347,7 +347,7 @@ Stop-Transcript | Out-Null
             Console.WriteLine(string.Format(@"
 ╔══════════════════════════════════════════════════════════════╗
 ║     Windows Incident Response Triage Collection Tool         ║
-║                    Version {0}                         ║
+║                    Version {0}                               ║
 ╚══════════════════════════════════════════════════════════════╝
 ", version));
 
