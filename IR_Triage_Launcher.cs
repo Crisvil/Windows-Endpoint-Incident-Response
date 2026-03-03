@@ -9,7 +9,10 @@ namespace IRTriageLauncher
 {
     class Program
     {
-        // === PowerShell Scripts (fixed paths, UTF-8, transcript, safer logic) ===
+        // =========================
+        // POWERSELL SCRIPTS (FIXED)
+        // =========================
+
         private static readonly string BasicTriageScript = @"
 # ======================
 # Basic Windows Endpoint Triage Collection for Incident Response
@@ -330,6 +333,10 @@ Write-Host ('[+] Memory Analysis Complete: {0}' -f $outputPath) -ForegroundColor
 Stop-Transcript | Out-Null
 ";
 
+        // =========================
+        // PROGRAM ENTRY
+        // =========================
+
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
@@ -447,6 +454,10 @@ Stop-Transcript | Out-Null
             Console.WriteLine("\nPress any key to exit...");
             Console.ReadKey(true);
         }
+
+        // =========================
+        // HELPERS
+        // =========================
 
         static bool IsAdministrator()
         {
