@@ -2,262 +2,398 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
-using System.Text;
 using System.Security.Principal;
+using System.Text;
 
 namespace IRTriageLauncher
 {
     class Program
     {
-        // Embedded PowerShell scripts - Base64 encoded to avoid string escaping issues
+        // === PowerShell Scripts (fixed paths, UTF-8, transcript, safer logic) ===
         private static readonly string BasicTriageScript = @"
+# ======================
 # Basic Windows Endpoint Triage Collection for Incident Response
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputPath = 'C:\IR_Collection_$timestamp'
+# ======================
 
-if (-not (Test-Path $outputPath)) {
-    New-Item -ItemType Directory -Path $outputPath | Out-Null
-}
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$outputRoot = Join-Path $env:SystemDrive 'IR_Collection'
+$outputPath = Join-Path $outputRoot $timestamp
+if (-not (Test-Path $outputPath)) { New-Item -ItemType Directory -Path $outputPath -Force | Out-Null }
+
+Start-Transcript -Path (Join-Path $outputPath 'transcript.txt') -Force | Out-Null
 
 Write-Host '[*] IR Triage Collection Started' -ForegroundColor Cyan
-Write-Host '[*] Output: $outputPath' -ForegroundColor Green
+Write-Host ('[*] Output: {0}' -f $outputPath) -ForegroundColor Green
 
-# System Information
-Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture, 
-    TotalPhysicalMemory, CsName, CsDomain, BiosBIOSVersion, BiosManufacturer, 
-    OsLastBootUpTime | Out-File '$outputPath\SystemInfo.txt'
+try {
+    # System Information
+    Get-ComputerInfo |
+        Select-Object WindowsProductName, WindowsVersion, OsArchitecture, TotalPhysicalMemory, CsName, CsDomain, BiosBIOSVersion, BiosManufacturer, OsLastBootUpTime |
+        Out-File (Join-Path $outputPath 'SystemInfo.txt') -Encoding UTF8
 
-# Hotfixes
-Get-HotFix | Select-Object HotFixID, Description, InstalledBy, InstalledOn | 
-    Sort-Object InstalledOn -Descending | Out-File '$outputPath\Hotfixes.txt'
+    # Hotfixes
+    Get-HotFix |
+        Select-Object HotFixID, Description, InstalledBy, InstalledOn |
+        Sort-Object InstalledOn -Descending |
+        Out-File (Join-Path $outputPath 'Hotfixes.txt') -Encoding UTF8
 
-# Local Users and Groups
-Get-LocalUser | Select-Object Name, Enabled, Description, LastLogon, PasswordLastSet, SID | 
-    Export-Csv '$outputPath\LocalUsers.csv' -NoTypeInformation
+    # Local Users & Groups
+    Get-LocalUser |
+        Select-Object Name, Enabled, Description, LastLogon, PasswordLastSet, SID |
+        Export-Csv (Join-Path $outputPath 'LocalUsers.csv') -NoTypeInformation -Encoding UTF8
 
-Get-LocalGroup | Select-Object Name, Description, SID | 
-    Export-Csv '$outputPath\LocalGroups.csv' -NoTypeInformation
+    Get-LocalGroup |
+        Select-Object Name, Description, SID |
+        Export-Csv (Join-Path $outputPath 'LocalGroups.csv') -NoTypeInformation -Encoding UTF8
+}
+catch {
+    Write-Host ('[!] System/Accounts section error: {0}' -f $_) -ForegroundColor Red
+}
 
 # Process Analysis
-$processes = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, 
-    Name, ExecutablePath, CommandLine,
-    @{Name='Owner'; Expression={ try { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User } catch { 'N/A' }}},
-    CreationDate
+try {
+    $processes = Get-CimInstance Win32_Process | ForEach-Object {
+        $p = $_
+        $owner = 'N/A'
+        try { $owner = (Invoke-CimMethod -InputObject $p -MethodName GetOwner).User } catch {}
+        [PSCustomObject]@{
+            ProcessId      = $p.ProcessId
+            ParentProcessId= $p.ParentProcessId
+            Name           = $p.Name
+            ExecutablePath = $p.ExecutablePath
+            CommandLine    = $p.CommandLine
+            Owner          = $owner
+            CreationDate   = $p.CreationDate
+        }
+    }
 
-$processes | Export-Csv '$outputPath\Processes_Full.csv' -NoTypeInformation
+    $processes | Export-Csv (Join-Path $outputPath 'Processes_Full.csv') -NoTypeInformation -Encoding UTF8
 
-# Suspicious Process Detection
-$suspicious = $processes | Where-Object {
-    ($_.ExecutablePath -eq $null) -or
-    ($_.ExecutablePath -like '*\Temp\*') -or
-    ($_.ExecutablePath -like '*\AppData\*') -or
-    ($_.ExecutablePath -like '*\Downloads\*') -or
-    ($_.ExecutablePath -like '*\Public\*') -or
-    ($_.ExecutablePath -like '*\PerfLogs\*')
+    # Suspicious Process Heuristics
+    $suspicious = $processes | Where-Object {
+        ($_.ExecutablePath -eq $null) -or
+        ($_.ExecutablePath -like '*\Temp\*') -or
+        ($_.ExecutablePath -like '*\AppData\*') -or
+        ($_.ExecutablePath -like '*\Downloads\*') -or
+        ($_.ExecutablePath -like '*\Public\*') -or
+        ($_.ExecutablePath -like '*\PerfLogs\*')
+    }
+
+    if ($suspicious) {
+        $suspicious |
+            Sort-Object Name, ProcessId |
+            Format-Table ProcessId, Name, ExecutablePath, Owner, CommandLine -Wrap |
+            Out-File (Join-Path $outputPath 'Suspicious_Processes.txt') -Encoding UTF8
+        Write-Host '[!] Suspicious processes detected!' -ForegroundColor Red
+    }
+}
+catch {
+    Write-Host ('[!] Process analysis error: {0}' -f $_) -ForegroundColor Red
 }
 
-if ($suspicious) {
-    $suspicious | Format-Table ProcessId, Name, ExecutablePath, Owner, CommandLine -Wrap | 
-        Out-File '$outputPath\Suspicious_Processes.txt'
-    Write-Host '[!] Suspicious processes detected!' -ForegroundColor Red
+# Network
+try {
+    Get-NetTCPConnection | Where-Object State -eq 'Established' |
+        Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess, State |
+        Export-Csv (Join-Path $outputPath 'TCP_Connections.csv') -NoTypeInformation -Encoding UTF8
+
+    Get-NetUDPEndpoint |
+        Select-Object LocalAddress, LocalPort, OwningProcess |
+        Export-Csv (Join-Path $outputPath 'UDP_Endpoints.csv') -NoTypeInformation -Encoding UTF8
+}
+catch {
+    Write-Host ('[!] Network query error: {0}' -f $_) -ForegroundColor Red
 }
 
-# Network Connections
-Get-NetTCPConnection | Where-Object State -eq 'Established' | 
-    Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess, CreationTime | 
-    Export-Csv '$outputPath\TCP_Connections.csv' -NoTypeInformation
+# Services & Tasks
+try {
+    Get-CimInstance Win32_Service |
+        Select-Object Name, DisplayName, State, StartMode, PathName |
+        Export-Csv (Join-Path $outputPath 'Services.csv') -NoTypeInformation -Encoding UTF8
 
-Get-NetUDPEndpoint | Select-Object LocalAddress, LocalPort, OwningProcess | 
-    Export-Csv '$outputPath\UDP_Endpoints.csv' -NoTypeInformation
-
-# Services and Scheduled Tasks
-Get-CimInstance Win32_Service | Select-Object Name, DisplayName, State, StartMode, PathName | 
-    Export-Csv '$outputPath\Services.csv' -NoTypeInformation
-
-Get-ScheduledTask | Where-Object State -ne 'Disabled' | 
-    Select-Object TaskName, TaskPath, State, Author, Actions, Triggers | 
-    Export-Csv '$outputPath\ScheduledTasks.csv' -NoTypeInformation
+    Get-ScheduledTask | Where-Object State -ne 'Disabled' |
+        Select-Object TaskName, TaskPath, State, Author,
+                      @{n='Actions';e={$_.Actions | ForEach-Object {$_.Execute + ' ' + $_.Arguments} -join '; '}},
+                      @{n='Triggers';e={$_.Triggers | ForEach-Object { $_.ToString() } -join '; '}} |
+        Export-Csv (Join-Path $outputPath 'ScheduledTasks.csv') -NoTypeInformation -Encoding UTF8
+}
+catch {
+    Write-Host ('[!] Services/Tasks error: {0}' -f $_) -ForegroundColor Red
+}
 
 # Registry Run Keys
-$runKeys = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
-    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
-    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run',
-    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run'
-)
+try {
+    $runKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run'
+    )
 
-foreach ($key in $runKeys) {
-    if (Test-Path $key) {
-        $safeName = ($key -replace '[:\\]', '_')
-        Get-ItemProperty $key | Out-File '$outputPath\RunKey_$safeName.txt'
+    foreach ($key in $runKeys) {
+        if (Test-Path $key) {
+            $safeName = ($key -replace '[:\\]', '_')
+            Get-ItemProperty $key |
+                Out-File (Join-Path $outputPath ('RunKey_{0}.txt' -f $safeName)) -Encoding UTF8
+        }
     }
+}
+catch {
+    Write-Host ('[!] Run keys error: {0}' -f $_) -ForegroundColor Red
 }
 
 # Startup Folders
-$startupFolders = @(
-    '$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup',
-    '$env:PROGRAMDATA\Microsoft\Windows\Start Menu\Programs\Startup'
-)
+try {
+    $startupFolders = @(
+        (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'),
+        (Join-Path $env:PROGRAMDATA 'Microsoft\Windows\Start Menu\Programs\Startup')
+    )
 
-'Startup Folder Items:' | Out-File '$outputPath\StartupItems.txt'
-foreach ($folder in $startupFolders) {
-    if (Test-Path $folder) {
-        '$folder' | Out-File '$outputPath\StartupItems.txt' -Append
-        Get-ChildItem $folder | Select-Object Name, FullName, CreationTimeUtc, LastWriteTimeUtc | 
-            Out-File '$outputPath\StartupItems.txt' -Append
+    $startupItemsFile = Join-Path $outputPath 'StartupItems.txt'
+    'Startup Folder Items:' | Out-File $startupItemsFile -Encoding UTF8
+    foreach ($folder in $startupFolders) {
+        if (Test-Path $folder) {
+            ('{0}' -f $folder) | Out-File $startupItemsFile -Append -Encoding UTF8
+            Get-ChildItem $folder |
+                Select-Object Name, FullName, CreationTimeUtc, LastWriteTimeUtc |
+                Format-Table -AutoSize | Out-File $startupItemsFile -Append -Encoding UTF8
+        }
     }
+}
+catch {
+    Write-Host ('[!] Startup items error: {0}' -f $_) -ForegroundColor Red
 }
 
 # DNS Cache
-ipconfig /displaydns | Out-File '$outputPath\DNSCache.txt'
-
-# Event Logs
-$logs = @('Security', 'System', 'Application')
-foreach ($log in $logs) {
-    $file = '$outputPath\$log`Events.csv'
-    try {
-        Get-WinEvent -LogName $log -MaxEvents 5000 -ErrorAction Stop | 
-            Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | 
-            Export-Csv $file -NoTypeInformation
-        Write-Host '[+] $log events exported' -ForegroundColor Green
-    } catch {
-        Write-Host '[-] Failed to export $log events' -ForegroundColor Red
-    }
+try {
+    ipconfig /displaydns | Out-File (Join-Path $outputPath 'DNSCache.txt') -Encoding UTF8
+}
+catch {
+    Write-Host ('[!] DNS cache export error: {0}' -f $_) -ForegroundColor Red
 }
 
-Write-Host '[+] Collection complete: $outputPath' -ForegroundColor Green
+# Event Logs (top 5000)
+try {
+    $logs = @('Security', 'System', 'Application')
+    foreach ($log in $logs) {
+        $file = Join-Path $outputPath ('{0}_Events.csv' -f $log)
+        try {
+            Get-WinEvent -LogName $log -MaxEvents 5000 -ErrorAction Stop |
+              Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+              Export-Csv $file -NoTypeInformation -Encoding UTF8
+            Write-Host ('[+] {0} events exported' -f $log) -ForegroundColor Green
+        }
+        catch {
+            Write-Host ('[-] Failed to export {0} events: {1}' -f $log, $_) -ForegroundColor Yellow
+        }
+    }
+}
+catch {
+    Write-Host ('[!] Event logs section error: {0}' -f $_) -ForegroundColor Red
+}
+
+Write-Host ('[+] Collection complete: {0}' -f $outputPath) -ForegroundColor Green
+Stop-Transcript | Out-Null
 ";
 
         private static readonly string AdvancedMemoryScript = @"
+# ======================
 # Advanced Memory Analysis Module
+# ======================
+
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputPath = 'C:\AdvancedIR_Memory_$timestamp'
+$outputRoot = Join-Path $env:SystemDrive 'AdvancedIR_Memory'
+$outputPath = Join-Path $outputRoot $timestamp
 New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 
+Start-Transcript -Path (Join-Path $outputPath 'transcript.txt') -Force | Out-Null
 Write-Host '[*] Advanced Memory Analysis Started' -ForegroundColor Cyan
 
-# Process Analysis with Anomaly Detection
-$processes = Get-CimInstance Win32_Process | ForEach-Object {
-    $proc = $_
-    $isDotNet = $false
-    $isHollowed = $false
-    
-    try {
-        $procId = $proc.ProcessId
-        if ($procId -gt 0 -and $procId -ne 4) {
-            $procDetails = Get-Process -Id $procId -ErrorAction SilentlyContinue
-            if ($procDetails) {
-                $modules = $procDetails.Modules | Where-Object { $_.ModuleName -match 'clr.dll|mscoree.dll' }
-                $isDotNet = [bool]$modules
-                
-                $imagePath = $proc.ExecutablePath
-                if ($imagePath) {
-                    $expectedName = [System.IO.Path]::GetFileNameWithoutExtension($imagePath)
-                    $actualName = $proc.Name -replace '\.exe$', ''
-                    if ($expectedName -and $expectedName -ne $actualName) {
-                        $isHollowed = $true
+# Process Analysis with Anomaly Heuristics
+try {
+    $processes = Get-CimInstance Win32_Process | ForEach-Object {
+        $proc = $_
+        $isDotNet = $false
+        $isHollowed = $false
+        $owner = 'N/A'
+
+        try {
+            $procId = $proc.ProcessId
+            if ($procId -gt 0 -and $procId -ne 4) {
+                $procDetails = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                if ($procDetails) {
+                    try {
+                        $modules = $procDetails.Modules | Where-Object { $_.ModuleName -match 'clr.dll|mscoree.dll' }
+                        $isDotNet = [bool]$modules
+                    } catch {}
+                    $imagePath = $proc.ExecutablePath
+                    if ($imagePath) {
+                        $expectedName = [System.IO.Path]::GetFileNameWithoutExtension($imagePath)
+                        $actualName = $proc.Name -replace '\.exe$', ''
+                        if ($expectedName -and $expectedName -ne $actualName) { $isHollowed = $true }
                     }
                 }
             }
+        } catch {}
+
+        try { $owner = (Invoke-CimMethod -InputObject $proc -MethodName GetOwner).User } catch {}
+
+        [PSCustomObject]@{
+            ProcessId             = $proc.ProcessId
+            ParentProcessId       = $proc.ParentProcessId
+            Name                  = $proc.Name
+            ExecutablePath        = $proc.ExecutablePath
+            CommandLine           = $proc.CommandLine
+            Owner                 = $owner
+            CreationDate          = $proc.CreationDate
+            IsDotNet              = $isDotNet
+            IsPotentiallyHollowed = $isHollowed
+            ThreadCount           = $proc.ThreadCount
+            HandleCount           = $proc.HandleCount
+            WorkingSetSize        = $proc.WorkingSetSize
         }
-    } catch { }
-    
-    [PSCustomObject]@{
-        ProcessId = $proc.ProcessId
-        ParentProcessId = $proc.ParentProcessId
-        Name = $proc.Name
-        ExecutablePath = $proc.ExecutablePath
-        CommandLine = $proc.CommandLine
-        Owner = try { (Invoke-CimMethod -InputObject $proc -MethodName GetOwner).User } catch { 'N/A' }
-        CreationDate = $proc.CreationDate
-        IsDotNet = $isDotNet
-        IsPotentiallyHollowed = $isHollowed
-        ThreadCount = $proc.ThreadCount
-        HandleCount = $proc.HandleCount
-        WorkingSetSize = $proc.WorkingSetSize
+    }
+
+    $processes | Export-Csv (Join-Path $outputPath 'Advanced_Process_Analysis.csv') -NoTypeInformation -Encoding UTF8
+
+    $injectionIndicators = $processes | Where-Object {
+        ($_.ExecutablePath -eq $null -and $_.ProcessId -ne 0) -or
+        ($_.IsDotNet -and ($_.ParentProcessId -in @(1, 4, 0))) -or
+        ($_.IsPotentiallyHollowed) -or
+        ($_.HandleCount -gt 1000 -and $_.ThreadCount -lt 5)
+    }
+
+    if ($injectionIndicators) {
+        $injectionIndicators | Export-Csv (Join-Path $outputPath 'Injection_Indicators.csv') -NoTypeInformation -Encoding UTF8
+        Write-Host '[!] Potential injection artifacts detected!' -ForegroundColor Red
     }
 }
-
-$processes | Export-Csv '$outputPath\Advanced_Process_Analysis.csv' -NoTypeInformation
-
-# Injection Indicators
-$injectionIndicators = $processes | Where-Object {
-    ($_.ExecutablePath -eq $null -and $_.ProcessId -ne 0) -or
-    ($_.IsDotNet -and $_.ParentProcessId -in @(1, 4, 0)) -or
-    ($_.IsPotentiallyHollowed) -or
-    ($_.HandleCount -gt 1000 -and $_.ThreadCount -lt 5)
+catch {
+    Write-Host ('[!] Process anomaly section error: {0}' -f $_) -ForegroundColor Red
 }
 
-if ($injectionIndicators) {
-    $injectionIndicators | Export-Csv '$outputPath\Injection_Indicators.csv' -NoTypeInformation
-    Write-Host '[!] Potential injection artifacts detected!' -ForegroundColor Red
-}
-
-# ETW Session Check
-$etwSessions = logman query -ets | Select-String '^\s+(\S+)\s+(\S+)\s+(\S+)' | ForEach-Object {
-    $matches = $_.Matches[0].Groups
-    [PSCustomObject]@{
-        SessionName = $matches[1].Value
-        Type = $matches[2].Value
-        Status = $matches[3].Value
-    }
-}
-$etwSessions | Export-Csv '$outputPath\ETW_Sessions.csv' -NoTypeInformation
-
-# AMSI Check via Event Logs
-$amsiEvents = Get-WinEvent -FilterHashtable @{
-    LogName = 'Microsoft-Windows-PowerShell/Operational'
-    ID = 4104
-    StartTime = (Get-Date).AddHours(-24)
-} -ErrorAction SilentlyContinue | Where-Object {
-    $_.Message -match 'amsiInitFailed|AmsiScanBuffer|System.Management.Automation.AmsiUtils'
-} | Select-Object TimeCreated, Id, Message
-
-if ($amsiEvents) {
-    $amsiEvents | Export-Csv '$outputPath\AMSI_Bypass_Indicators.csv' -NoTypeInformation
-    Write-Host '[!] AMSI bypass attempts detected!' -ForegroundColor Red
-}
-
-# Credential Protection Check
-$lsaProtection = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RunAsPPL' -ErrorAction SilentlyContinue
+# ETW Sessions
 try {
-    $credentialGuard = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard' -ErrorAction SilentlyContinue
-    $cgStatus = if ($credentialGuard.SecurityServicesRunning -band 0x01) { 'Running' } else { 'Not Running' }
-} catch {
-    $cgStatus = 'Unknown'
+    $etwSessions = logman query -ets |
+        Select-String '^\s+(\S+)\s+(\S+)\s+(\S+)' |
+        ForEach-Object {
+            $m = $_.Matches[0].Groups
+            [PSCustomObject]@{ SessionName = $m[1].Value; Type = $m[2].Value; Status = $m[3].Value }
+        }
+    $etwSessions | Export-Csv (Join-Path $outputPath 'ETW_Sessions.csv') -NoTypeInformation -Encoding UTF8
+}
+catch {
+    Write-Host ('[!] ETW enumeration error: {0}' -f $_) -ForegroundColor Yellow
 }
 
-[PSCustomObject]@{
-    LSAProtection = if ($lsaProtection.RunAsPPL -eq 1) { 'Enabled' } else { 'Disabled' }
-    CredentialGuard = $cgStatus
-} | Export-Csv '$outputPath\Credential_Protection_Status.csv' -NoTypeInformation
+# AMSI-related PowerShell events (last 24h)
+try {
+    $amsiEvents = Get-WinEvent -FilterHashtable @{
+        LogName   = 'Microsoft-Windows-PowerShell/Operational'
+        ID        = 4104
+        StartTime = (Get-Date).AddHours(-24)
+    } -ErrorAction SilentlyContinue | Where-Object {
+        $_.Message -match 'amsiInitFailed|AmsiScanBuffer|System.Management.Automation.AmsiUtils'
+    } | Select-Object TimeCreated, Id, Message
 
-Write-Host '[+] Memory Analysis Complete: $outputPath' -ForegroundColor Green
+    if ($amsiEvents) {
+        $amsiEvents | Export-Csv (Join-Path $outputPath 'AMSI_Bypass_Indicators.csv') -NoTypeInformation -Encoding UTF8
+        Write-Host '[!] AMSI bypass attempts detected!' -ForegroundColor Red
+    }
+}
+catch {
+    Write-Host ('[!] AMSI event parsing error: {0}' -f $_) -ForegroundColor Yellow
+}
+
+# Credential Protection (LSA PPL & Credential Guard)
+try {
+    $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RunAsPPL' -ErrorAction SilentlyContinue
+    $lsaStatus = if ($null -ne $lsa -and ($lsa.RunAsPPL -eq 1 -or $lsa.RunAsPPL -eq 2)) { 'Enabled' } else { 'Disabled' }
+
+    $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard' -ErrorAction SilentlyContinue
+    $cgStatus = 'Unknown'
+    if ($dg -and $dg.SecurityServicesRunning) {
+        $cgStatus = if ($dg.SecurityServicesRunning -contains 1) { 'Running' } else { 'Not Running' }
+    }
+
+    [PSCustomObject]@{
+        LSAProtection   = $lsaStatus
+        CredentialGuard = $cgStatus
+    } | Export-Csv (Join-Path $outputPath 'Credential_Protection_Status.csv') -NoTypeInformation -Encoding UTF8
+}
+catch {
+    Write-Host ('[!] Credential protection query error: {0}' -f $_) -ForegroundColor Yellow
+}
+
+Write-Host ('[+] Memory Analysis Complete: {0}' -f $outputPath) -ForegroundColor Green
+Stop-Transcript | Out-Null
 ";
 
         static void Main(string[] args)
         {
-            Console.WriteLine(@"
+            Console.OutputEncoding = Encoding.UTF8;
+            Console.Title = "Windows IR Triage Collection Tool";
+
+            string version = "2.1.0";
+            try
+            {
+                Assembly asm = Assembly.GetExecutingAssembly();
+                Version ver = asm != null ? asm.GetName().Version : null;
+                if (ver != null) version = ver.ToString();
+            }
+            catch { }
+
+            Console.WriteLine(string.Format(@"
 ╔══════════════════════════════════════════════════════════════╗
 ║     Windows Incident Response Triage Collection Tool         ║
-║                    Version 2.0                               ║
+║                    Version {0}                         ║
 ╚══════════════════════════════════════════════════════════════╝
-");
+", version));
 
-            // Check for Administrator privileges
+            // Self-elevate if not admin
             if (!IsAdministrator())
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("[!] ERROR: This tool requires Administrator privileges.");
-                Console.WriteLine("[!] Please run as Administrator.");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[!] Administrator privileges required. Elevating...");
                 Console.ResetColor();
-                Console.WriteLine("\nPress any key to exit...");
-                Console.ReadKey();
+
+                try
+                {
+                    string exe = null;
+
+                    try
+                    {
+                        Process current = Process.GetCurrentProcess();
+                        if (current != null && current.MainModule != null)
+                            exe = current.MainModule.FileName;
+                    }
+                    catch { }
+
+                    if (string.IsNullOrEmpty(exe))
+                    {
+                        try { exe = Assembly.GetExecutingAssembly().Location; } catch { }
+                    }
+
+                    if (string.IsNullOrEmpty(exe))
+                        throw new Exception("Unable to determine executable path.");
+
+                    ProcessStartInfo psiElevate = new ProcessStartInfo(exe);
+                    psiElevate.UseShellExecute = true;
+                    psiElevate.Verb = "runas";
+                    psiElevate.Arguments = args != null ? string.Join(" ", args) : "";
+
+                    Process.Start(psiElevate);
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("[!] Elevation failed: " + ex.Message);
+                    Console.ResetColor();
+                }
                 return;
             }
 
-            // Display menu
             Console.WriteLine("Select operation mode:");
             Console.WriteLine("1. Basic Triage Collection (Standard artifacts)");
             Console.WriteLine("2. Advanced Memory Analysis (Process injection, ETW, AMSI)");
@@ -266,15 +402,26 @@ Write-Host '[+] Memory Analysis Complete: $outputPath' -ForegroundColor Green
             Console.Write("\nSelection [1-4]: ");
 
             string choice = Console.ReadLine();
+            string scriptToRun = null;
 
-            string scriptToRun = choice switch
+            switch (choice)
             {
-                "1" => BasicTriageScript,
-                "2" => AdvancedMemoryScript,
-                "3" => BasicTriageScript + "\n" + AdvancedMemoryScript,
-                "4" => null,
-                _ => BasicTriageScript
-            };
+                case "1":
+                    scriptToRun = BasicTriageScript;
+                    break;
+                case "2":
+                    scriptToRun = AdvancedMemoryScript;
+                    break;
+                case "3":
+                    scriptToRun = BasicTriageScript + Environment.NewLine + AdvancedMemoryScript;
+                    break;
+                case "4":
+                    scriptToRun = null;
+                    break;
+                default:
+                    scriptToRun = BasicTriageScript;
+                    break;
+            }
 
             if (scriptToRun == null) return;
 
@@ -284,63 +431,77 @@ Write-Host '[+] Memory Analysis Complete: $outputPath' -ForegroundColor Green
             try
             {
                 ExecutePowerShellScript(scriptToRun);
-                
+
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine("\n[+] Collection completed successfully!");
-                Console.WriteLine("[+] Check C:\\IR_Collection_* or C:\\AdvancedIR_* folders for results.");
+                Console.WriteLine("[+] Check C:\\IR_Collection\\<timestamp> and C:\\AdvancedIR_Memory\\<timestamp> for results.");
                 Console.ResetColor();
             }
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"\n[!] Error during execution: {ex.Message}");
+                Console.WriteLine("\n[!] Error during execution: " + ex.Message);
                 Console.ResetColor();
             }
 
             Console.WriteLine("\nPress any key to exit...");
-            Console.ReadKey();
+            Console.ReadKey(true);
         }
 
         static bool IsAdministrator()
         {
             using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
             {
+                if (identity == null) return false;
                 WindowsPrincipal principal = new WindowsPrincipal(identity);
                 return principal.IsInRole(WindowsBuiltInRole.Administrator);
             }
         }
 
+        static string ResolvePowerShellPath()
+        {
+            string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            bool is64OS = Environment.Is64BitOperatingSystem;
+            bool is64Proc = Environment.Is64BitProcess;
+
+            if (is64OS && !is64Proc)
+            {
+                // 32-bit process on 64-bit OS → use Sysnative to reach 64-bit PowerShell
+                return Path.Combine(windir, "Sysnative", "WindowsPowerShell", "v1.0", "powershell.exe");
+            }
+            return Path.Combine(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        }
+
         static void ExecutePowerShellScript(string script)
         {
-            // Encode script to Base64 to avoid command line escaping issues
+            // PowerShell -EncodedCommand expects UTF-16LE (Unicode)
             string encodedScript = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-            
-            ProcessStartInfo psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-ExecutionPolicy Bypass -NoProfile -EncodedCommand {encodedScript}",
-                Verb = "runas", // Ensure admin rights
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = false,
-                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows)
-            };
 
-            using (Process process = new Process { StartInfo = psi })
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = ResolvePowerShellPath();
+            psi.Arguments = "-ExecutionPolicy Bypass -NoProfile -EncodedCommand " + encodedScript;
+            psi.UseShellExecute = false;             // capture output
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = false;
+            psi.WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+
+            using (Process process = new Process())
             {
-                process.OutputDataReceived += (sender, e) => 
+                process.StartInfo = psi;
+
+                process.OutputDataReceived += (sender, e) =>
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                         Console.WriteLine(e.Data);
                 };
-                
-                process.ErrorDataReceived += (sender, e) => 
+
+                process.ErrorDataReceived += (sender, e) =>
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                     {
                         Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"[ERROR] {e.Data}");
+                        Console.WriteLine("[ERROR] " + e.Data);
                         Console.ResetColor();
                     }
                 };
@@ -351,9 +512,7 @@ Write-Host '[+] Memory Analysis Complete: $outputPath' -ForegroundColor Green
                 process.WaitForExit();
 
                 if (process.ExitCode != 0)
-                {
-                    throw new Exception($"PowerShell exited with code {process.ExitCode}");
-                }
+                    throw new Exception("PowerShell exited with code " + process.ExitCode);
             }
         }
     }
