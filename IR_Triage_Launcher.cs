@@ -10,7 +10,7 @@ namespace IRTriageLauncher
     class Program
     {
         // =========================
-        // POWERSELL SCRIPTS (FIXED)
+        // EMBEDDED POWERSHELL SCRIPTS
         // =========================
 
         private static readonly string BasicTriageScript = @"
@@ -116,8 +116,9 @@ try {
 
     Get-ScheduledTask | Where-Object State -ne 'Disabled' |
         Select-Object TaskName, TaskPath, State, Author,
-                      @{n='Actions';e={$_.Actions | ForEach-Object {$_.Execute + ' ' + $_.Arguments} -join '; '}},
-                      @{n='Triggers';e={$_.Triggers | ForEach-Object { $_.ToString() } -join '; '}} |
+                      @{n='Actions';e={($_.Actions | ForEach-Object { ('{0} {1}' -f $_.Execute, $_.Arguments).Trim() }) -join '; '}},
+                      @{n='Triggers';e={($_.Triggers | ForEach-Object { $_.CimClass.CimClassName -replace '^MSFT_Task', '' }) -join '; '}},
+                      @{n='RunAs';e={$_.Principal.UserId}} |
         Export-Csv (Join-Path $outputPath 'ScheduledTasks.csv') -NoTypeInformation -Encoding UTF8
 }
 catch {
@@ -342,7 +343,7 @@ Stop-Transcript | Out-Null
             Console.OutputEncoding = Encoding.UTF8;
             Console.Title = "Windows IR Triage Collection Tool";
 
-            string version = "2.1.0";
+            string version = "2.2.0";
             try
             {
                 Assembly asm = Assembly.GetExecutingAssembly();
@@ -351,12 +352,13 @@ Stop-Transcript | Out-Null
             }
             catch { }
 
-            Console.WriteLine(string.Format(@"
-╔══════════════════════════════════════════════════════════════╗
-║     Windows Incident Response Triage Collection Tool         ║
-║                    Version {0}                               ║
-╚══════════════════════════════════════════════════════════════╝
-", version));
+            const int boxWidth = 62;
+            Console.WriteLine();
+            Console.WriteLine("╔" + new string('═', boxWidth) + "╗");
+            Console.WriteLine("║" + Center("Windows Incident Response Triage Collection Tool", boxWidth) + "║");
+            Console.WriteLine("║" + Center("Version " + version, boxWidth) + "║");
+            Console.WriteLine("╚" + new string('═', boxWidth) + "╝");
+            Console.WriteLine();
 
             // Self-elevate if not admin
             if (!IsAdministrator())
@@ -388,7 +390,7 @@ Stop-Transcript | Out-Null
                     ProcessStartInfo psiElevate = new ProcessStartInfo(exe);
                     psiElevate.UseShellExecute = true;
                     psiElevate.Verb = "runas";
-                    psiElevate.Arguments = args != null ? string.Join(" ", args) : "";
+                    psiElevate.Arguments = args != null ? string.Join(" ", Array.ConvertAll(args, QuoteArg)) : "";
 
                     Process.Start(psiElevate);
                 }
@@ -401,36 +403,46 @@ Stop-Transcript | Out-Null
                 return;
             }
 
-            Console.WriteLine("Select operation mode:");
-            Console.WriteLine("1. Basic Triage Collection (Standard artifacts)");
-            Console.WriteLine("2. Advanced Memory Analysis (Process injection, ETW, AMSI)");
-            Console.WriteLine("3. Full Collection (Both modules)");
-            Console.WriteLine("4. Exit");
-            Console.Write("\nSelection [1-4]: ");
+            // Non-interactive use: --mode basic|advanced|full  (also accepts 1|2|3)
+            string choice = GetArgValue(args, "--mode");
+            bool interactive = choice == null;
 
-            string choice = Console.ReadLine();
-            string scriptToRun = null;
+            if (interactive)
+            {
+                Console.WriteLine("Select operation mode:");
+                Console.WriteLine("1. Basic Triage Collection (Standard artifacts)");
+                Console.WriteLine("2. Advanced Memory Analysis (Process injection, ETW, AMSI)");
+                Console.WriteLine("3. Full Collection (Both modules)");
+                Console.WriteLine("4. Exit");
+                Console.Write("\nSelection [1-4]: ");
+                choice = Console.ReadLine();
+            }
 
-            switch (choice)
+            string scriptToRun;
+            switch ((choice ?? "").Trim().ToLowerInvariant())
             {
                 case "1":
+                case "basic":
                     scriptToRun = BasicTriageScript;
                     break;
                 case "2":
+                case "advanced":
                     scriptToRun = AdvancedMemoryScript;
                     break;
                 case "3":
+                case "full":
                     scriptToRun = BasicTriageScript + Environment.NewLine + AdvancedMemoryScript;
                     break;
                 case "4":
-                    scriptToRun = null;
-                    break;
+                case "exit":
+                    return;
                 default:
-                    scriptToRun = BasicTriageScript;
-                    break;
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("[!] Invalid selection: '" + choice + "'. Use 1-4 or --mode basic|advanced|full.");
+                    Console.ResetColor();
+                    Environment.ExitCode = 2;
+                    return;
             }
-
-            if (scriptToRun == null) return;
 
             Console.WriteLine("\n[*] Starting collection...");
             Console.WriteLine("[*] Do not close this window until completion.\n");
@@ -449,15 +461,46 @@ Stop-Transcript | Out-Null
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine("\n[!] Error during execution: " + ex.Message);
                 Console.ResetColor();
+                Environment.ExitCode = 1;
             }
 
-            Console.WriteLine("\nPress any key to exit...");
-            Console.ReadKey(true);
+            if (interactive && !Console.IsInputRedirected)
+            {
+                Console.WriteLine("\nPress any key to exit...");
+                Console.ReadKey(true);
+            }
         }
 
         // =========================
         // HELPERS
         // =========================
+
+        static string Center(string text, int width)
+        {
+            if (text.Length >= width) return text.Substring(0, width);
+            int left = (width - text.Length) / 2;
+            return new string(' ', left) + text + new string(' ', width - text.Length - left);
+        }
+
+        static string GetArgValue(string[] args, string name)
+        {
+            if (args == null) return null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+                    return i + 1 < args.Length ? args[i + 1] : "";
+                if (args[i].StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+                    return args[i].Substring(name.Length + 1);
+            }
+            return null;
+        }
+
+        static string QuoteArg(string arg)
+        {
+            if (string.IsNullOrEmpty(arg)) return "\"\"";
+            if (arg.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return arg;
+            return "\"" + arg.Replace("\"", "\\\"") + "\"";
+        }
 
         static bool IsAdministrator()
         {

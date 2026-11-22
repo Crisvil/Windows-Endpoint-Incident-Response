@@ -1,0 +1,6 @@
+bin/
+obj/
+publish/
+IR_Collection/
+*.dmp
+*.etl
