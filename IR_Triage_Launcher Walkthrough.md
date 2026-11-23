@@ -12,7 +12,19 @@ Multiple build methods are supported:
 
 ✅ Modern .NET 6/7/8 Single-File Publish
 
-## Option 1: Build Using Visual Studio (Recommended)
+## Option 0: Build From This Repository (Quickest)
+
+The repo includes `IRTriageLauncher.csproj` (.NET 8). With the .NET 8 SDK installed:
+
+```powershell
+dotnet publish IRTriageLauncher.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+```
+
+Output: `publish\IR_Triage_Tool.exe`. GitHub Actions also builds this exe on every push to `main` (see the workflow run's artifacts).
+
+Run non-interactively with `IR_Triage_Tool.exe --mode basic|advanced|full`.
+
+## Option 1: Build Using Visual Studio
 1️⃣ Open Visual Studio 2022
 
 Install Visual Studio 2022 with .NET desktop development workload.
